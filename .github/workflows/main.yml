@@ -1,0 +1,609 @@
+name: Android Development Environment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare system resources
+        run: |
+          sudo swapoff -a 2>/dev/null || true
+          sudo systemctl stop snapd.socket snapd 2>/dev/null || true
+          sudo apt-get remove -y snapd 2>/dev/null || true
+          sudo apt-get autoremove -y -qq 2>/dev/null || true
+          sudo modprobe kvm 2>/dev/null || true
+          sudo modprobe kvm-intel 2>/dev/null || sudo modprobe kvm-amd 2>/dev/null || true
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+          ulimit -n 65536
+          echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf > /dev/null
+          sudo sysctl -p 2>/dev/null || true
+
+      - name: Install system packages
+        run: |
+          sudo dpkg --add-architecture i386 2>/dev/null || true
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb x11vnc websockify \
+            python3 python3-pip \
+            openjdk-17-jdk-headless \
+            curl wget unzip git \
+            android-tools-adb \
+            mesa-utils libgles2-mesa-dev libegl-mesa0 libgl1-mesa-dri \
+            libc6:i386 libncurses5:i386 libstdc++6:i386 lib32z1 libbz2-1.0:i386 \
+            kvm qemu-kvm \
+            net-tools socat openssh-client \
+            xdotool x11-utils 2>/dev/null
+          pip3 install -q aiohttp
+          if [ ! -d /usr/share/novnc ]; then
+            sudo git clone --depth=1 \
+              https://github.com/novnc/noVNC.git /usr/share/novnc 2>/dev/null
+          fi
+
+      - name: Install Android SDK
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+          wget -q \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+            -O /tmp/ct.zip
+          unzip -q /tmp/ct.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" \
+             "$ANDROID_HOME/cmdline-tools/latest" 2>/dev/null || true
+          rm -f /tmp/ct.zip
+
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "emulator" \
+            "system-images;android-34;google_apis;x86_64" \
+            2>&1 | grep -v "^Info\|^\[="
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Create Galaxy S23 AVD
+        run: |
+          echo "no" | avdmanager create avd \
+            --name "galaxy_s23" \
+            --package "system-images;android-34;google_apis;x86_64" \
+            --device "pixel_6_pro" \
+            --force 2>/dev/null
+
+          AVD_CFG="$HOME/.android/avd/galaxy_s23.avd/config.ini"
+
+          sed -i '/^hw\.cpu\|^hw\.ram\|^hw\.lcd\|^hw\.gpu\|^hw\.key\|^hw\.main\|^hw\.track\|^hw\.dPad\|^hw\.audio\|^hw\.cam\|^hw\.sdCard\|^sdcard\|^AvdId\|^avd\.ini\|^tag\.\|^PlayStore/d' \
+            "$AVD_CFG"
+
+          cat >> "$AVD_CFG" << 'HWEOF'
+AvdId=galaxy_s23
+avd.ini.encoding=UTF-8
+PlayStore.enabled=false
+tag.id=google_apis
+tag.display=Google APIs
+hw.cpu.ncore=4
+hw.ramSize=6144
+hw.lcd.width=1080
+hw.lcd.height=2340
+hw.lcd.density=393
+hw.lcd.vsync=120
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.keyboard=yes
+hw.mainKeys=no
+hw.trackBall=no
+hw.dPad=no
+hw.audioInput=no
+hw.audioOutput=no
+hw.camera.back=emulated
+hw.camera.front=emulated
+hw.sdCard=yes
+sdcard.size=512M
+HWEOF
+
+      - name: Write authentication gate
+        run: |
+          cat > /tmp/gate.py << 'PYEOF'
+#!/usr/bin/env python3
+"""Reverse-proxy authentication gate for noVNC session."""
+
+import asyncio
+import base64
+import os
+import sys
+
+try:
+    import aiohttp
+    from aiohttp import web
+except ImportError:
+    print("aiohttp missing", file=sys.stderr)
+    sys.exit(1)
+
+_K = base64.b64decode(
+    os.environ.get("_GA", "") + os.environ.get("_GB", "")
+).decode()
+
+_BACKEND = "http://127.0.0.1:6080"
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Secure Session</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #1a1d27;
+      --border: #2d3147;
+      --text: #e1e4f0;
+      --sub: #8b90a7;
+      --accent: #5865f2;
+      --accent2: #7c83f7;
+      --err: #f04747;
+    }
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
+        Roboto, Ubuntu, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .wrap { width: 100%; max-width: 380px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 40px 32px 36px;
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0,0,0,.45);
+    }
+    .logo { font-size: 2.4rem; margin-bottom: 18px; }
+    h1 { font-size: 1.35rem; font-weight: 700; margin-bottom: 6px; }
+    .sub { color: var(--sub); font-size: .88rem; margin-bottom: 30px; }
+    .field { position: relative; margin-bottom: 14px; }
+    input[type=password],
+    input[type=text] {
+      width: 100%;
+      padding: 12px 46px 12px 16px;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: .97rem;
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(88,101,242,.18);
+    }
+    .toggle {
+      position: absolute;
+      right: 13px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 1.1rem;
+      color: var(--sub);
+      padding: 2px;
+      line-height: 1;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+    }
+    .btn:hover { opacity: .9; transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); }
+    .err-msg {
+      color: var(--err);
+      font-size: .84rem;
+      margin-top: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="logo">🔒</div>
+      <h1>Secure Session</h1>
+      <p class="sub">Nhập mật khẩu để truy cập thiết bị</p>
+      <form method="POST" action="/auth" autocomplete="off">
+        <div class="field">
+          <input type="password" id="pw" name="k"
+                 placeholder="Mật khẩu…" autofocus>
+          <button
+            type="button"
+            class="toggle"
+            onclick="var i=document.getElementById('pw');
+                     i.type=i.type==='password'?'text':'password';"
+          >👁</button>
+        </div>
+        <button type="submit" class="btn">Kết nối &rarr;</button>
+      </form>
+      {ERR}
+    </div>
+  </div>
+</body>
+</html>"""
+
+ERR_BLOCK = '<p class="err-msg">Mật khẩu không đúng. Vui lòng thử lại.</p>'
+_SESS_COOKIE = "_gs"
+_SESS_VAL = "authenticated"
+
+
+def _authed(req: web.Request) -> bool:
+    return req.cookies.get(_SESS_COOKIE) == _SESS_VAL
+
+
+async def handle_index(req: web.Request) -> web.Response:
+    if _authed(req):
+        raise web.HTTPFound("/app/vnc.html")
+    return web.Response(
+        text=LOGIN_HTML.replace("{ERR}", ""),
+        content_type="text/html",
+    )
+
+
+async def handle_auth(req: web.Request) -> web.Response:
+    data = await req.post()
+    entered = data.get("k", "")
+    if entered == _K:
+        resp = web.HTTPFound("/app/vnc.html")
+        resp.set_cookie(
+            _SESS_COOKIE, _SESS_VAL,
+            httponly=True, samesite="Strict", path="/",
+        )
+        return resp
+    return web.Response(
+        text=LOGIN_HTML.replace("{ERR}", ERR_BLOCK),
+        content_type="text/html",
+    )
+
+
+async def handle_proxy(req: web.Request) -> web.StreamResponse:
+    if not _authed(req):
+        raise web.HTTPFound("/")
+
+    tail = req.match_info.get("tail", "")
+    target_url = f"{_BACKEND}/{tail}"
+    if req.query_string:
+        target_url += "?" + req.query_string
+
+    is_ws = (
+        req.headers.get("Upgrade", "").lower() == "websocket"
+        or tail in ("websockify", "websockify/")
+    )
+
+    if is_ws:
+        ws_in = web.WebSocketResponse(protocols=("binary",))
+        await ws_in.prepare(req)
+
+        async with aiohttp.ClientSession() as sess:
+            ws_url = target_url.replace("http://", "ws://", 1)
+            async with sess.ws_connect(
+                ws_url,
+                protocols=("binary",),
+            ) as ws_out:
+
+                async def forward(src, dst):
+                    async for msg in src:
+                        if msg.type == aiohttp.WSMsgType.BINARY:
+                            await dst.send_bytes(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.TEXT:
+                            await dst.send_str(msg.data)
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            break
+
+                await asyncio.gather(
+                    forward(ws_in, ws_out),
+                    forward(ws_out, ws_in),
+                )
+
+        return ws_in
+
+    skip = {"host", "connection", "transfer-encoding"}
+    hdrs = {k: v for k, v in req.headers.items()
+            if k.lower() not in skip}
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.request(
+            req.method, target_url,
+            headers=hdrs,
+            data=await req.read(),
+            allow_redirects=False,
+        ) as resp:
+            body = await resp.read()
+            out_hdrs = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in (skip | {"content-length"})
+            }
+            return web.Response(
+                body=body,
+                status=resp.status,
+                headers=out_hdrs,
+            )
+
+
+app = web.Application()
+app.router.add_route("*", "/", handle_index)
+app.router.add_post("/auth", handle_auth)
+app.router.add_route("*", "/app/{tail:.*}", handle_proxy)
+
+if __name__ == "__main__":
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=8080,
+        print=None,
+        access_log=None,
+    )
+PYEOF
+          chmod +x /tmp/gate.py
+
+      - name: Write S23 property installer
+        run: |
+          cat > /tmp/apply_s23.sh << 'SHEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ADB="${1:-adb}"
+
+patch_prop() {
+  local file="$1" key="$2" val="$3"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$file"
+  fi
+}
+
+echo "[s23] Fetching build.prop..."
+"$ADB" pull /system/build.prop /tmp/s23_build.prop
+
+patch_prop /tmp/s23_build.prop ro.product.model               "SM-S911B"
+patch_prop /tmp/s23_build.prop ro.product.odm.model           "SM-S911B"
+patch_prop /tmp/s23_build.prop ro.product.system.model        "SM-S911B"
+patch_prop /tmp/s23_build.prop ro.product.vendor.model        "SM-S911B"
+patch_prop /tmp/s23_build.prop ro.product.brand               "samsung"
+patch_prop /tmp/s23_build.prop ro.product.odm.brand           "samsung"
+patch_prop /tmp/s23_build.prop ro.product.system.brand        "samsung"
+patch_prop /tmp/s23_build.prop ro.product.vendor.brand        "samsung"
+patch_prop /tmp/s23_build.prop ro.product.manufacturer        "samsung"
+patch_prop /tmp/s23_build.prop ro.product.odm.manufacturer    "samsung"
+patch_prop /tmp/s23_build.prop ro.product.system.manufacturer "samsung"
+patch_prop /tmp/s23_build.prop ro.product.vendor.manufacturer "samsung"
+patch_prop /tmp/s23_build.prop ro.product.name                "dm1qxxx"
+patch_prop /tmp/s23_build.prop ro.product.odm.name            "dm1qxxx"
+patch_prop /tmp/s23_build.prop ro.product.system.name         "dm1qxxx"
+patch_prop /tmp/s23_build.prop ro.product.vendor.name         "dm1qxxx"
+patch_prop /tmp/s23_build.prop ro.product.device              "dm1q"
+patch_prop /tmp/s23_build.prop ro.product.odm.device          "dm1q"
+patch_prop /tmp/s23_build.prop ro.product.system.device       "dm1q"
+patch_prop /tmp/s23_build.prop ro.product.vendor.device       "dm1q"
+
+patch_prop /tmp/s23_build.prop ro.board.platform              "kalama"
+patch_prop /tmp/s23_build.prop ro.hardware.chipname           "SM8550"
+patch_prop /tmp/s23_build.prop ro.vendor.chipname             "SM8550"
+patch_prop /tmp/s23_build.prop ro.soc.manufacturer            "Qualcomm"
+patch_prop /tmp/s23_build.prop ro.soc.model                   "SM8550"
+
+patch_prop /tmp/s23_build.prop ro.product.cpu.abi             "arm64-v8a"
+patch_prop /tmp/s23_build.prop ro.product.cpu.abilist         "arm64-v8a,armeabi-v7a,armeabi"
+patch_prop /tmp/s23_build.prop ro.product.cpu.abilist64       "arm64-v8a"
+patch_prop /tmp/s23_build.prop ro.product.cpu.abilist32       "armeabi-v7a,armeabi"
+
+patch_prop /tmp/s23_build.prop ro.hardware.vulkan             "adreno"
+patch_prop /tmp/s23_build.prop ro.hardware.egl                "adreno"
+patch_prop /tmp/s23_build.prop ro.hardware.gralloc            "adreno"
+patch_prop /tmp/s23_build.prop ro.hardware.hwcomposer         "adreno"
+patch_prop /tmp/s23_build.prop ro.vendor.qti.va_fp            "1"
+patch_prop /tmp/s23_build.prop ro.gfx.driver.0                "com.qualcomm.qti.gpudrivers.kalama.release"
+
+patch_prop /tmp/s23_build.prop ro.sf.lcd_density              "393"
+patch_prop /tmp/s23_build.prop persist.sf.lcd_density         "393"
+patch_prop /tmp/s23_build.prop ro.product.lcd_density         "393"
+
+patch_prop /tmp/s23_build.prop ro.build.version.oneui         "50100"
+patch_prop /tmp/s23_build.prop ro.build.version.release       "13"
+patch_prop /tmp/s23_build.prop ro.build.version.sdk           "33"
+patch_prop /tmp/s23_build.prop ro.build.version.security_patch "2023-07-01"
+patch_prop /tmp/s23_build.prop ro.build.flavor                "dm1qxxx-user"
+patch_prop /tmp/s23_build.prop ro.build.fingerprint \
+  "samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXU5CWL1:user/release-keys"
+patch_prop /tmp/s23_build.prop ro.vendor.build.fingerprint \
+  "samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXU5CWL1:user/release-keys"
+patch_prop /tmp/s23_build.prop ro.odm.build.fingerprint \
+  "samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXU5CWL1:user/release-keys"
+
+patch_prop /tmp/s23_build.prop ro.csc.country_code            "BRI"
+patch_prop /tmp/s23_build.prop ro.csc.sales_code              "BRI"
+patch_prop /tmp/s23_build.prop ro.boot.csc                    "BRI"
+
+echo "[s23] Pushing build.prop..."
+"$ADB" push /tmp/s23_build.prop /system/build.prop
+"$ADB" shell chmod 644 /system/build.prop
+
+"$ADB" pull /vendor/build.prop /tmp/s23_vendor.prop 2>/dev/null || true
+if [ -f /tmp/s23_vendor.prop ]; then
+  patch_prop /tmp/s23_vendor.prop ro.vendor.product.model  "SM-S911B"
+  patch_prop /tmp/s23_vendor.prop ro.vendor.product.brand  "samsung"
+  patch_prop /tmp/s23_vendor.prop ro.board.platform        "kalama"
+  patch_prop /tmp/s23_vendor.prop ro.hardware.chipname     "SM8550"
+  patch_prop /tmp/s23_vendor.prop ro.soc.model             "SM8550"
+  patch_prop /tmp/s23_vendor.prop ro.hardware.egl          "adreno"
+  patch_prop /tmp/s23_vendor.prop ro.hardware.vulkan       "adreno"
+  "$ADB" push /tmp/s23_vendor.prop /vendor/build.prop
+  "$ADB" shell chmod 644 /vendor/build.prop
+  echo "[s23] vendor/build.prop patched."
+fi
+
+while IFS='=' read -r k v; do
+  "$ADB" shell "setprop '$k' '$v'" 2>/dev/null || true
+done << 'PROPS'
+ro.product.model=SM-S911B
+ro.product.brand=samsung
+ro.product.manufacturer=samsung
+ro.board.platform=kalama
+ro.hardware.chipname=SM8550
+ro.soc.model=SM8550
+ro.product.cpu.abi=arm64-v8a
+ro.hardware.egl=adreno
+ro.hardware.vulkan=adreno
+PROPS
+
+"$ADB" shell wm size 1080x2340 2>/dev/null || true
+"$ADB" shell wm density 393   2>/dev/null || true
+
+echo "[s23] Profile complete."
+SHEOF
+          chmod +x /tmp/apply_s23.sh
+
+      - name: Start virtual display and VNC
+        run: |
+          Xvfb :99 -screen 0 1080x2340x24 -ac &
+          XVFB_PID=$!
+          sleep 2
+
+          export DISPLAY=:99
+
+          _A="V2luZG93c1JE"
+          _B="UDIwMjZA"
+          _P=$(python3 -c "import base64,sys;sys.stdout.write(base64.b64decode('${_A}${_B}').decode())")
+
+          x11vnc \
+            -display :99 \
+            -passwd "$_P" \
+            -forever \
+            -shared \
+            -noxdamage \
+            -ncache 10 \
+            -listen 127.0.0.1 \
+            -port 5900 \
+            -bg \
+            -logfile /tmp/vnc.log
+
+          unset _P _A _B
+
+          websockify \
+            --web=/usr/share/novnc \
+            127.0.0.1:6080 \
+            127.0.0.1:5900 \
+            > /tmp/ws.log 2>&1 &
+
+          sleep 2
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          echo "XVFB_PID=$XVFB_PID" >> "$GITHUB_ENV"
+
+      - name: Launch Android emulator
+        run: |
+          export DISPLAY=:99
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          "$ANDROID_HOME/emulator/emulator" \
+            -avd galaxy_s23 \
+            -no-snapshot \
+            -no-snapshot-save \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -memory 6144 \
+            -cores 4 \
+            -no-audio \
+            -writable-system \
+            -no-metrics \
+            -dns-server 8.8.8.8 \
+            > /tmp/emu.log 2>&1 &
+
+          EMU_PID=$!
+          echo "EMU_PID=$EMU_PID" >> "$GITHUB_ENV"
+          echo "[emu] PID $EMU_PID — waiting for boot..."
+
+      - name: Wait for Android boot
+        timeout-minutes: 12
+        run: |
+          adb wait-for-device
+
+          until adb shell getprop sys.boot_completed 2>/dev/null \
+              | tr -d '\r' | grep -q '^1'; do
+            sleep 5
+          done
+          echo "[emu] Boot complete."
+
+          adb root   || true
+          sleep 3
+          adb remount || true
+          sleep 2
+
+      - name: Apply Samsung Galaxy S23 profile
+        run: |
+          bash /tmp/apply_s23.sh adb
+
+      - name: Optional One UI launcher
+        run: |
+          if [ -f ./oneui_home.apk ]; then
+            adb install -r -g ./oneui_home.apk
+            adb shell cmd package set-home-activity \
+              "com.samsung.android.app.launcher/.activities.SearchActivity" \
+              2>/dev/null || true
+            echo "[ui] One UI Home installed."
+          else
+            echo "[ui] No oneui_home.apk found — skipping."
+          fi
+
+      - name: Reboot and confirm S23 identity
+        timeout-minutes: 8
+        run: |
+          adb reboot
+          sleep 12
+
+          adb wait-for-device
+          until adb shell getprop sys.boot_completed 2>/dev/null \
+              | tr -d '\r' | grep -q '^1'; do
+            sleep 5
+          done
+
+          MODEL=$(adb shell getprop ro.product.model       2>/dev/null | tr -d '\r')
+          BRAND=$(adb shell getprop ro.product.brand       2>/dev/null | tr -d '\r')
+          CPU=$(adb shell getprop ro.hardware.chipname     2>/dev/null | tr -d '\r')
+          ABI=$(adb shell getprop 
